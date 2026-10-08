@@ -138,11 +138,15 @@ def repair_and_pack_textures(source_path):
 
 
 def _file_holds(path, data):
-    """Whether the file at *path* holds exactly the bytes *data*."""
-    if os.path.getsize(path) != len(data):
+    """Whether the file at *path* holds exactly the bytes *data* (False when
+    it cannot be read, e.g. removed meanwhile by another process)."""
+    try:
+        if os.path.getsize(path) != len(data):
+            return False
+        with open(path, 'rb') as fh:
+            return fh.read() == bytes(data)
+    except OSError:
         return False
-    with open(path, 'rb') as fh:
-        return fh.read() == bytes(data)
 
 
 def write_sidecar(texture_dir, name, ext, data):

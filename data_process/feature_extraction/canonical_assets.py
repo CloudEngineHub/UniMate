@@ -302,6 +302,12 @@ def bake_canonical_assets(export_dir, features_dir, assets_dir=None, dataset_typ
             for fmt, path in extra_files:
                 os.replace(f'{partial}.{fmt}', path)
             os.replace(partial + '.glb', final)
+            # Another format of the asset that this run did not write was
+            # baked from the older inputs (the GLB is always written).
+            for fmt in CANONICAL_FORMATS:
+                stale = os.path.join(out_dir, f'{name}.{fmt}')
+                if fmt != 'glb' and fmt not in formats and os.path.isfile(stale):
+                    os.remove(stale)
         except Exception as exc:  # noqa: BLE001 — keep the batch going
             if isinstance(exc, UndeterminedRoll):   # incl. CollinearSkeleton
                 logger.info(f"Canonical GLB of '{name}' refused: {exc}")

@@ -8,6 +8,8 @@ import numpy as np
 _COMPONENTS = {5120: np.int8, 5121: np.uint8, 5122: np.int16, 5123: np.uint16,
                5125: np.uint32, 5126: np.float32}
 _SIZES = {'SCALAR': 1, 'VEC2': 2, 'VEC3': 3, 'VEC4': 4, 'MAT4': 16}
+# Component types a sparse accessor's indices may have.
+_INDEX_COMPONENTS = {5121: np.uint8, 5123: np.uint16, 5125: np.uint32}
 _JSON_CHUNK, _BIN_CHUNK = 0x4E4F534A, 0x004E4942
 
 
@@ -29,22 +31,68 @@ class Glb:
             offset += 8 + length
         self.nodes = self.json.get('nodes', [])
 
+    def _view_start(self, view_index, byte_offset, nbytes):
+        """Where in the binary chunk *nbytes* at *byte_offset* into a
+        bufferView start; ValueError for a view of another buffer than the
+        GLB's own, or a read past the view or the chunk."""
+        view = self.json['bufferViews'][view_index]
+        if view.get('buffer', 0) != 0:
+            raise ValueError(f"bufferView {view_index} reads buffer {view['buffer']}: only "
+                             f"the GLB's binary chunk (buffer 0) is supported")
+        start = view.get('byteOffset', 0) + byte_offset
+        length = view.get('byteLength', len(self.bin) - view.get('byteOffset', 0))
+        if byte_offset + nbytes > length or start + nbytes > len(self.bin):
+            raise ValueError(f"bufferView {view_index}: {nbytes} bytes at offset {byte_offset} "
+                             f"read past the view ({length} bytes) or the binary chunk")
+        return view, start
+
     def accessor(self, index):
-        """Accessor *index* as a float64 ``(count, components)`` array."""
+        """Accessor *index* as a float64 ``(count, components)`` array (glTF
+        2.0 accessors: interleaved or not, no ``bufferView`` meaning zeros,
+        ``sparse`` replacements, ``normalized`` integers); ValueError for an
+        unsupported or malformed one."""
         acc = self.json['accessors'][index]
-        view = self.json['bufferViews'][acc['bufferView']]
+        if acc['componentType'] not in _COMPONENTS or acc['type'] not in _SIZES:
+            raise ValueError(f"accessor {index}: unsupported componentType "
+                             f"{acc['componentType']} / type {acc['type']!r}")
         dtype = np.dtype(_COMPONENTS[acc['componentType']])
-        width = _SIZES[acc['type']]
-        start = view.get('byteOffset', 0) + acc.get('byteOffset', 0)
-        stride = view.get('byteStride', 0) or dtype.itemsize * width
-        raw = np.frombuffer(self.bin, dtype=np.uint8, offset=start,
-                            count=stride * (acc['count'] - 1) + dtype.itemsize * width)
-        rows = np.lib.stride_tricks.as_strided(raw, (acc['count'], dtype.itemsize * width),
-                                               (stride, 1))
-        arr = np.ascontiguousarray(rows).view(dtype).reshape(acc['count'], width)
+        width, count = _SIZES[acc['type']], acc['count']
+        if 'bufferView' in acc:
+            stride = (self.json['bufferViews'][acc['bufferView']].get('byteStride', 0)
+                      or dtype.itemsize * width)
+            nbytes = stride * (count - 1) + dtype.itemsize * width if count else 0
+            _, start = self._view_start(acc['bufferView'], acc.get('byteOffset', 0), nbytes)
+            raw = np.frombuffer(self.bin, dtype=np.uint8, offset=start, count=nbytes)
+            rows = np.lib.stride_tricks.as_strided(raw, (count, dtype.itemsize * width),
+                                                   (stride, 1))
+            arr = np.ascontiguousarray(rows).view(dtype).reshape(count, width)
+        else:
+            arr = np.zeros((count, width), dtype=dtype)
+        sparse = acc.get('sparse')
+        if sparse:
+            arr = arr.copy()
+            n = sparse['count']
+            ind = sparse['indices']
+            if ind['componentType'] not in _INDEX_COMPONENTS:
+                raise ValueError(f"accessor {index}: sparse index componentType "
+                                 f"{ind['componentType']} is not an unsigned integer type")
+            itype = np.dtype(_INDEX_COMPONENTS[ind['componentType']])
+            _, istart = self._view_start(ind['bufferView'], ind.get('byteOffset', 0),
+                                         n * itype.itemsize)
+            indices = np.frombuffer(self.bin, dtype=itype, count=n, offset=istart).astype(np.int64)
+            if n and (indices[-1] >= count or np.any(np.diff(indices) <= 0)):
+                raise ValueError(f"accessor {index}: sparse indices must strictly increase "
+                                 f"and stay below count {count}")
+            vals = sparse['values']
+            _, vstart = self._view_start(vals['bufferView'], vals.get('byteOffset', 0),
+                                         n * width * dtype.itemsize)
+            arr[indices] = np.frombuffer(self.bin, dtype=dtype, count=n * width,
+                                         offset=vstart).reshape(n, width)
         arr = arr.astype(np.float64)
-        if acc.get('normalized'):
+        if acc.get('normalized') and dtype.kind in 'iu':
             arr /= np.iinfo(dtype).max
+            if dtype.kind == 'i':
+                np.maximum(arr, -1.0, out=arr)
         return arr
 
     @staticmethod

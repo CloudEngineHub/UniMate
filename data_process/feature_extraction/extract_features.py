@@ -36,7 +36,12 @@ result under ``<save_dir>/cond_parts/`` and is skipped on rerun. The cache
 records the clip / threshold / topology settings and the export files (name,
 size, mtime) it was built from and is re-processed automatically when they
 change; delete ``cond_parts/`` (or one entry) to force re-processing for any
-other reason.
+other reason. An entry that does not record the export files is re-processed
+too, unless ``--adopt_legacy_cache`` vouches that the export has not changed
+since it was written. With ``--vis``, a cached object whose previews are
+missing, were made with another ``--vis_ground`` or with unrecorded settings
+is processed again into a temporary directory, and its outputs replace the
+cached ones only when every clip got its preview.
 
 Object types that fail are logged to ``<save_dir>/extract_errors.log``,
 recorded in ``filtered_clips.json`` and skipped (no cache entry is written,
@@ -54,6 +59,7 @@ import hashlib
 import json
 import multiprocessing as mp
 import os
+import shutil
 import zipfile
 from os.path import join as pjoin
 
@@ -228,6 +234,11 @@ def parse_args(argv=None):
                              "follow camera, contact shadow and root "
                              "trajectory (default). --no-vis_ground renders "
                              "the plain cubic view instead.")
+    parser.add_argument("--adopt_legacy_cache", action="store_true",
+                        help="Keep cond_parts/ entries that record no export digest "
+                             "instead of re-processing their objects, and stamp them with "
+                             "the current one. Only for entries known to be built from the "
+                             "current export: nothing checks it.")
     parser.add_argument("--save_glb", action="store_true",
                         help="Afterwards bake <data_dir>/rigs/<asset>.glb (the export stage's "
                              "rest-pose assets, run_export.sh --save_glb / --glb_only) into the "
@@ -522,7 +533,7 @@ def _export_digest(task):
     """Digest of the inputs the settings hash cannot see: each clip NPZ's name,
     size and mtime (a re-export under the same clip names) and the object's
     ``joint_names.json`` entry (its order drives the clean-name realignment).
-    Kept beside ``params_hash`` rather than in it (see :func:`_load_cached_result`)."""
+    Kept beside ``params_hash`` rather than in it (see :func:`_load_cached_payload`)."""
     files = []
     for path in sorted(task['object_npzs']):
         st = os.stat(path)
@@ -530,11 +541,15 @@ def _export_digest(task):
     return _digest([files, task.get('expected_names')])
 
 
-def _load_cached_result(part_path, object_type, params, params_hash, export_digest):
-    """Return a cached object result, or None when absent / stale / unreadable.
+def _load_cached_payload(part_path, object_type, params, params_hash, export_digest,
+                         adopt_legacy=False):
+    """Return the cache entry of an object (``result`` and what it was built
+    from), or None when absent / stale / unreadable.
 
-    An entry without an ``export_digest`` is taken as built from the current
-    export and stamped with its digest."""
+    An entry without an ``export_digest`` cannot show that it was built from
+    the current export, so it is a miss unless *adopt_legacy*
+    (``--adopt_legacy_cache``) vouches for it; it is then stamped with the
+    current digest."""
     if not os.path.isfile(part_path):
         return None
     try:
@@ -544,18 +559,23 @@ def _load_cached_result(part_path, object_type, params, params_hash, export_dige
                        f're-processing')
         return None
 
-    if 'params_hash' not in payload:
+    if 'params_hash' not in payload or 'result' not in payload:
         logger.info(f'[{object_type}] cache invalidated (entry predates settings '
-                    f'tracking); re-processing')
+                    f'tracking or holds no result); re-processing')
         return None
     if payload['params_hash'] == params_hash:
         cached_digest = payload.get('export_digest')
         if cached_digest is None:
+            if not adopt_legacy:
+                logger.info(f'[{object_type}] cache entry records no export digest; '
+                            f're-processing (--adopt_legacy_cache keeps entries known to '
+                            f'match the current export)')
+                return None
             payload['export_digest'] = export_digest
             atomic_np_save(part_path, payload)
-            return payload.get('result')
+            return payload
         if cached_digest == export_digest:
-            return payload.get('result')
+            return payload
         logger.info(f'[{object_type}] cache invalidated (export NPZs or joint_names.json '
                     f'entry changed); re-processing')
         return None
@@ -601,12 +621,146 @@ def _prune_object_clips(save_dir, clip_prefix, prune_vis):
     return removed
 
 
+def _vis_record(save_vis, vis_ground):
+    """The preview settings a cache entry records: None when the run made no
+    previews."""
+    return {'ground': bool(vis_ground)} if save_vis else None
+
+
+def _previews_current(payload, save_dir, clip_prefix, vis_ground):
+    """Whether a cached object's previews are the ones a ``--vis`` run with
+    *vis_ground* makes: the entry records previews made with that ground
+    setting (an entry that records none, or no settings at all, does not
+    qualify), and every clip of the object in ``motions/`` has its
+    ``videos/<clip>.mp4``."""
+    record = payload.get('vis')
+    if not isinstance(record, dict) or record.get('ground') != bool(vis_ground):
+        return False
+    motions_dir, videos_dir = pjoin(save_dir, 'motions'), pjoin(save_dir, 'videos')
+    clips = [name[:-4] for name in (os.listdir(motions_dir) if os.path.isdir(motions_dir) else [])
+             if name.startswith(clip_prefix) and name.endswith('.npz')]
+    return all(os.path.isfile(pjoin(videos_dir, clip + '.mp4')) for clip in clips)
+
+
+def _rebuild_dir(save_dir, object_type):
+    return pjoin(save_dir, f'.rebuild_{object_type}')
+
+
+def _object_files(save_dir, object_type, clip_prefix):
+    """``(subdir, name)`` of every output file of the object: its clips,
+    previews and T-pose image."""
+    files = []
+    for sub, ext in (('motions', '.npz'), ('videos', '.mp4')):
+        d = pjoin(save_dir, sub)
+        files += [(sub, name) for name in (os.listdir(d) if os.path.isdir(d) else [])
+                  if name.startswith(clip_prefix) and name.endswith(ext)]
+    if os.path.isfile(pjoin(save_dir, 'tpose', f'{object_type}.png')):
+        files.append(('tpose', f'{object_type}.png'))
+    return files
+
+
+def _rebuild_with_previews(object_type, task, clip_prefix, part_path, payload, vis):
+    """Process a cached object again, with previews, into a temporary
+    directory beside the outputs; when every clip got its preview, swap its
+    files in and write its new cache entry.
+
+    The swap removes the cache entry first and moves the object's current
+    files into the temporary directory before the new ones go in, so an
+    error midway is undone (old files and entry restored) and a crash
+    midway leaves a miss, never an entry beside half-replaced files.
+
+    Returns ``('rebuilt', result)``; ``('kept', None)`` when the rebuild
+    failed and the cached files and entry are as before; or ``('lost',
+    error)`` when an undo failed too: the entry is then gone, so the next
+    run re-processes the object.
+    """
+    save_dir = task['save_dir']
+    tmp = _rebuild_dir(save_dir, object_type)
+    shutil.rmtree(tmp, ignore_errors=True)
+    try:
+        obj_cond, n_clips, n_frames, n_joints, filtered = process_object(
+            object_type, **dict(task, save_dir=tmp))
+        made = [(sub, name) for sub in ('motions', 'videos', 'tpose')
+                for name in (sorted(os.listdir(pjoin(tmp, sub)))
+                             if os.path.isdir(pjoin(tmp, sub)) else [])]
+        videos = {name for sub, name in made if sub == 'videos'}
+        missing = [name[:-4] for sub, name in made
+                   if sub == 'motions' and name[:-4] + '.mp4' not in videos]
+        if missing:
+            raise RuntimeError(f'{len(missing)} preview(s) not rendered, e.g. {missing[0]}')
+    except Exception as e:  # noqa: BLE001 — nothing of the cached object was touched
+        shutil.rmtree(tmp, ignore_errors=True)
+        logger.warning(f'[{object_type}] previews could not be rebuilt '
+                       f'({type(e).__name__}: {e}); kept the cached clips')
+        return 'kept', None
+    result = {'cond': obj_cond, 'n_clips': n_clips, 'n_frames': n_frames,
+              'n_joints': n_joints, 'filtered': filtered}
+
+    old_dir = pjoin(tmp, 'previous')
+    moved_out, moved_in = [], []
+    try:
+        if os.path.isfile(part_path):
+            os.remove(part_path)
+        for sub, name in _object_files(save_dir, object_type, clip_prefix):
+            os.makedirs(pjoin(old_dir, sub), exist_ok=True)
+            os.replace(pjoin(save_dir, sub, name), pjoin(old_dir, sub, name))
+            moved_out.append((sub, name))
+        for sub, name in made:
+            os.makedirs(pjoin(save_dir, sub), exist_ok=True)
+            os.replace(pjoin(tmp, sub, name), pjoin(save_dir, sub, name))
+            moved_in.append((sub, name))
+        atomic_np_save(part_path, {**payload, 'result': result, 'vis': vis})
+    except Exception as e:  # noqa: BLE001 — undo the swap
+        try:
+            for sub, name in moved_in:
+                os.remove(pjoin(save_dir, sub, name))
+            for sub, name in moved_out:
+                os.replace(pjoin(old_dir, sub, name), pjoin(save_dir, sub, name))
+            atomic_np_save(part_path, payload)
+        except Exception as undo:  # noqa: BLE001 — leave a miss behind
+            if os.path.isfile(part_path):
+                os.remove(part_path)
+            logger.error(f'[{object_type}] previews could not be swapped in '
+                         f'({type(e).__name__}: {e}) nor the swap undone '
+                         f'({type(undo).__name__}: {undo}); the object will be re-processed '
+                         f'(its earlier files are in {old_dir} until then)')
+            return 'lost', f'swap failed ({type(e).__name__}: {e}), undo failed ({undo})'
+        shutil.rmtree(tmp, ignore_errors=True)
+        logger.warning(f'[{object_type}] previews could not be swapped in '
+                       f'({type(e).__name__}: {e}); restored the cached clips')
+        return 'kept', None
+    shutil.rmtree(tmp, ignore_errors=True)
+    return 'rebuilt', result
+
+
+def _failed(object_type, save_dir, error):
+    """The result of an object that failed, its error appended to
+    ``extract_errors.log``."""
+    try:
+        os.makedirs(save_dir, exist_ok=True)
+        with open(_error_log_path(save_dir), 'a') as log_file:
+            log_file.write(f'{object_type}\t{error}\n')
+    except OSError as log_err:
+        logger.warning(f'[{object_type}] could not write error log: {log_err}')
+    return {
+        'cond': None, 'n_clips': 0, 'n_frames': 0, 'n_joints': 0,
+        'filtered': [{'name': f'{object_type} (all clips)',
+                      'reason': f'processing failed: {error}'}],
+        'error': error,
+    }
+
+
 def process_object_task(task):
     """Process one object type, caching its result for resume.
 
     ``task`` bundles every :func:`process_object` argument plus the part
     path. The cached result is reused only when it was produced with the same
     clip / threshold / topology settings (see ``CACHE_PARAM_KEYS``).
+
+    With ``save_vis``, a cached object whose previews are not current (see
+    :func:`_previews_current`) is rebuilt with :func:`_rebuild_with_previews`;
+    if that fails, the cached result is used without them, unless its files
+    could not be restored, which fails the object.
 
     Failures are contained here: the object is reported as failed (and its
     error appended to ``extract_errors.log``) instead of propagating, which
@@ -625,10 +779,22 @@ def process_object_task(task):
     export_digest = _export_digest(task)
     task.pop('root_offsets', None)   # cache key only; process_object reads the NPZs
     task.pop('rest_orientations', None)
+    adopt_legacy = task.pop('adopt_legacy_cache', False)
+    vis = _vis_record(task['save_vis'], task['vis_ground'])
 
-    cached = _load_cached_result(part_path, object_type, params, params_hash, export_digest)
-    if cached is not None:
-        return object_type, cached, True
+    payload = _load_cached_payload(part_path, object_type, params, params_hash,
+                                   export_digest, adopt_legacy=adopt_legacy)
+    if payload is not None:
+        if not task['save_vis'] or _previews_current(payload, task['save_dir'],
+                                                     clip_prefix, task['vis_ground']):
+            return object_type, payload['result'], True
+        status, value = _rebuild_with_previews(object_type, task, clip_prefix,
+                                               part_path, payload, vis)
+        if status == 'rebuilt':
+            return object_type, value, False
+        if status == 'kept':
+            return object_type, payload['result'], True
+        return object_type, _failed(object_type, task['save_dir'], value), False
 
     try:
         # The stale entry goes before the clips it describes: a run that
@@ -636,6 +802,7 @@ def process_object_task(task):
         # settings would reuse without its clips.
         if os.path.isfile(part_path):
             os.remove(part_path)
+        shutil.rmtree(_rebuild_dir(task['save_dir'], object_type), ignore_errors=True)
         removed = _prune_object_clips(task['save_dir'], clip_prefix, task['save_vis'])
         if removed:
             logger.info(f'[{object_type}] removed {removed} clip files from a '
@@ -644,18 +811,8 @@ def process_object_task(task):
             object_type, **task)
     except Exception as e:  # noqa: BLE001 — keep the batch going
         logger.exception(f'[{object_type}] failed to process')
-        try:
-            os.makedirs(task['save_dir'], exist_ok=True)
-            with open(_error_log_path(task['save_dir']), 'a') as log_file:
-                log_file.write(f'{object_type}\t{type(e).__name__}: {e}\n')
-        except OSError as log_err:
-            logger.warning(f'[{object_type}] could not write error log: {log_err}')
-        return object_type, {
-            'cond': None, 'n_clips': 0, 'n_frames': 0, 'n_joints': 0,
-            'filtered': [{'name': f'{object_type} (all clips)',
-                          'reason': f'processing failed: {type(e).__name__}: {e}'}],
-            'error': f'{type(e).__name__}: {e}',
-        }, False
+        return object_type, _failed(object_type, task['save_dir'],
+                                    f'{type(e).__name__}: {e}'), False
 
     result = {'cond': obj_cond, 'n_clips': n_clips, 'n_frames': n_frames,
               'n_joints': n_joints, 'filtered': filtered}
@@ -663,7 +820,8 @@ def process_object_task(task):
     # entry behind (unreadable ones are treated as misses, but this keeps them
     # from happening in the first place).
     atomic_np_save(part_path, {'params_hash': params_hash, 'params': params,
-                               'export_digest': export_digest, 'result': result})
+                               'export_digest': export_digest, 'result': result,
+                               'vis': vis})
     return object_type, result, False
 
 
@@ -741,6 +899,7 @@ def build_object_tasks(args, clip_stride, motion_dir, metadata):
             jump_ratio_threshold=args.jump_ratio_threshold,
             min_joints=args.min_joints, max_joints=args.max_joints,
             save_vis=args.vis, vis_ground=args.vis_ground,
+            adopt_legacy_cache=args.adopt_legacy_cache,
         ))
     return tasks
 

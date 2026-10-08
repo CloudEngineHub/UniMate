@@ -579,17 +579,20 @@ class SampleManifest:
     (``scripts/run_animate_motion.sh <output_dir>``) reads it instead of being
     told the dataset, cond and character again.
 
-    A run into a directory that already holds a manifest adds to it: earlier
-    motions stay drivable. An earlier asset of the same name that differs
-    (another cond, another joint order) loses its motions from the manifest,
-    since their files may be overwritten by this run's. Rewritten after every
-    chunk.
+    Every motion also records the frame digest of its asset's cond
+    (``frame_digest``), against which mesh driving checks the cond and the
+    canonical GLB. A run into a directory that already holds a manifest adds
+    to it: earlier motions stay drivable. An earlier asset of the same name
+    that differs (another cond, another joint order, another canonical frame)
+    loses its motions from the manifest, since their files may be overwritten
+    by this run's. Rewritten after every chunk.
     """
 
     FILE = 'manifest.json'
     FORMAT = 'unimate-samples/1'
-    # What makes two manifest assets of one name the same skeleton.
-    IDENTITY = ('cond_path', 'cond_key', 'joint_names')
+    # What makes two manifest assets of one name the same skeleton; a key an
+    # earlier manifest does not record is not compared.
+    IDENTITY = ('cond_path', 'cond_key', 'joint_names', 'frame_digest')
 
     def __init__(self, output_dir: str, args: InferenceArgs, model_path: str,
                  cfg_scale: float, mode: str, assets: Dict[str, Asset]):
@@ -608,7 +611,8 @@ class SampleManifest:
         for name, asset in sorted(assets.items()):
             entry = asset.manifest_entry()
             prev = self.data['assets'].get(name)
-            if prev is not None and any(prev.get(k) != entry[k] for k in self.IDENTITY):
+            if prev is not None and any(k in prev and prev[k] != entry[k]
+                                        for k in self.IDENTITY):
                 dropped = [k for k, v in self.data['samples'].items() if v.get('asset') == name]
                 for k in dropped:
                     del self.data['samples'][k]
@@ -621,8 +625,9 @@ class SampleManifest:
                                   'cfg_scale': cfg_scale, 'seed': args.seed, 'mode': mode})
 
     def add(self, npy_name: str, case_id: str, asset: str, prompt: str, kind: str = 'sample'):
+        frame = self.data['assets'].get(asset, {}).get('frame_digest')
         self.data['samples'][npy_name] = {'asset': asset, 'case_id': case_id, 'prompt': prompt,
-                                          'kind': kind, 'run': self.run}
+                                          'kind': kind, 'run': self.run, 'frame_digest': frame}
 
     def save(self):
         tmp = f'{self.path}.tmp'

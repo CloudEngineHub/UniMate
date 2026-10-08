@@ -68,6 +68,8 @@ place. Two kinds of fixes:
                              p -> quat * p + offset in export space (offset optional); the
                              processed GLB applies the same rotation. Idempotent, undone when the entry
                              is removed; see apply_rest_orientations)
+                             A zero or non-finite quat / offset in either JSON stops the run before any
+                             file is written (check_quat_patches; apply_* check their own file too).
     <ds>_rig_flags.txt       <rig>    # <category>: <reason>   (objaverse / general: hand-reviewed rig
                              flags -> export/<ds>/rig_flags.json; only tpose_wrong / not_in_legacy_raw
                              also go to export/<ds>/filtered_objects.txt, which stage 4 skips)
@@ -597,6 +599,69 @@ def write_activity_keep(ds, root, patch_dir, frames, dry_run, log):
 ROOT_OFFSET_KEY = 'root_offset_applied'   # the quat currently baked into this NPZ (w, x, y, z)
 
 
+def _vector_error(value, size, nonzero=False):
+    """Why *value* is not *size* finite numbers (non-zero ones when
+    *nonzero*), or ''."""
+    try:
+        arr = np.asarray(value, dtype=np.float64)
+    except (TypeError, ValueError):
+        return f'expected {size} numbers, got {value!r}'
+    if arr.shape != (size,):
+        return f'expected {size} numbers, got {value!r}'
+    if not np.all(np.isfinite(arr)):
+        return f'non-finite value in {value!r}'
+    if nonzero and np.linalg.norm(arr) < 1e-6:
+        return f'zero vector {value!r} has no direction'
+    return ''
+
+
+# Quaternion patches: file suffix -> the vector fields of an entry.
+QUAT_PATCHES = {'root_offsets': ('quat',), 'rest_orientation': ('quat', 'offset')}
+
+
+def quat_patch_errors(src, fields):
+    """Every malformed entry of the quaternion patch *src*: no ``quat``, or a
+    *fields* value that is not finite numbers (a zero quat has no rotation and
+    would be written into the export NPZs as NaN)."""
+    errors = []
+    for key, entry in load_overrides(src).items():
+        if not isinstance(entry, dict) or 'quat' not in entry:
+            errors.append(f'{os.path.basename(src)}: {key}: expected {{"quat": [w, x, y, z], ...}}')
+            continue
+        for field in fields:
+            if field in entry:
+                why = _vector_error(entry[field], 4 if field == 'quat' else 3,
+                                    nonzero=field == 'quat')
+                if why:
+                    errors.append(f'{os.path.basename(src)}: {key}: {field}: {why}')
+    return errors
+
+
+def load_quat_patch(src, fields):
+    """The entries of the quaternion patch *src*, or ValueError listing the
+    malformed ones before anything is applied."""
+    errors = quat_patch_errors(src, fields)
+    if errors:
+        raise ValueError('Malformed quaternion patch entries (nothing applied):\n  '
+                         + '\n  '.join(errors))
+    return load_overrides(src)
+
+
+def check_quat_patches(patch_dir, datasets):
+    """Raise SystemExit listing every malformed entry of every dataset's
+    quaternion patches, so a bad entry stops the run before any file of any
+    dataset is written."""
+    errors = []
+    for ds in datasets:
+        for suffix, fields in QUAT_PATCHES.items():
+            src = os.path.join(patch_dir, f'{ds}_{suffix}.json')
+            if os.path.isfile(src):
+                errors.extend(quat_patch_errors(src, fields))
+    if errors:
+        raise SystemExit('Malformed quaternion patch entries (nothing applied):\n  '
+                         + '\n  '.join(errors))
+
+
 def _save_npz_atomic(path, data):
     fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + '.', suffix='.tmp',
                                dir=os.path.dirname(path) or '.')
@@ -634,7 +699,7 @@ def apply_root_offsets(ds, root, patch_dir, dry_run, log):
     src = os.path.join(patch_dir, f'{ds}_root_offsets.json')
     if not os.path.isfile(src):
         return []           # no patch file: leave earlier fixes in place
-    want = load_overrides(src)
+    want = load_quat_patch(src, QUAT_PATCHES['root_offsets'])
     mdir = os.path.join(root, 'motions')
     changed, n_ok = [], 0
     targets = set(want)
@@ -707,7 +772,7 @@ def apply_rest_orientations(ds, root, patch_dir, dry_run, log):
     src = os.path.join(patch_dir, f'{ds}_rest_orientation.json')
     if not os.path.isfile(src):
         return []           # no patch file: leave earlier fixes in place
-    want = load_overrides(src)
+    want = load_quat_patch(src, QUAT_PATCHES['rest_orientation'])
     mdir = os.path.join(root, 'motions')
     by_rig = {}
     for f in glob.glob(os.path.join(mdir, '*.npz')):
@@ -1157,6 +1222,7 @@ def main():
                          '(<patch_dir>/.root_motion_cache.json)')
     args = ap.parse_args()
     os.makedirs(args.patch_dir, exist_ok=True)
+    check_quat_patches(args.patch_dir, args.datasets)
     log = []
     for ds in args.datasets:
         run_dataset(ds, args, log)

@@ -39,6 +39,9 @@ REPLACED_DIR = 'replaced'
 # The canonical rest-pose GLB of a cond entry carries its joint order under
 # this glTF extras key (feature_extraction/canonical_assets.py).
 CANONICAL_ORDER_KEY = 'canonical_joint_order'
+# ... and the cond_frame_digest of the cond it was baked from (a GLB without
+# it cannot be checked against the cond).
+FRAME_DIGEST_KEY = 'canonical_frame_digest'
 
 
 def default_assets_dir(features_dir):
@@ -252,6 +255,37 @@ def glb_joint_order(path):
     if isinstance(value, str):
         value = json.loads(value)
     return None if value is None else [str(n) for n in value]
+
+
+_FRAME_KEYS = ('joint_names', 'parents', 'tpos_first_frame', 'tpos_global_rotations')
+
+
+def _cond_hash(entry, fold_zero):
+    h = hashlib.sha1()
+    h.update(json.dumps([str(n) for n in entry['joint_names']]).encode())
+    h.update(np.asarray(entry['parents'], dtype=np.int64).tobytes())
+    for key in ('tpos_first_frame', 'tpos_global_rotations'):
+        values = np.round(np.asarray(entry[key], dtype=np.float64), 6)
+        h.update((values + 0.0 if fold_zero else values).tobytes())
+    return h.hexdigest()
+
+
+def cond_digest(entry):
+    """sha1 of a cond entry's joint names, hierarchy and canonical T-pose
+    (rounded to 1e-6): the cond part of a canonical GLB's resume digest."""
+    return _cond_hash(entry, fold_zero=False)
+
+
+def cond_frame_digest(entry):
+    """The canonical frame a cond entry defines, as :func:`cond_digest` but
+    with -0.0 taken as 0.0, so float noise around zero (whose sign can differ
+    between machines) leaves it unchanged; None when the entry lacks one of
+    the T-pose fields. Sampler manifests record it per motion and canonical
+    GLBs per bake (``FRAME_DIGEST_KEY``), and a motion is driven only against
+    a cond and a GLB of the same frame."""
+    if any(key not in entry for key in _FRAME_KEYS):
+        return None
+    return _cond_hash(entry, fold_zero=True)
 
 
 def check_glb_textures(glb_path, expected, unresolved):

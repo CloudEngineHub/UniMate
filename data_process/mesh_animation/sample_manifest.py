@@ -7,8 +7,13 @@ turns it into one job per motion for ``animate_motion.py`` and checks, before
 any Blender process starts, that the three still belong together:
 
 - the cond file still holds the asset's entry with the recorded joint order
-  (a cond rebuilt since sampling can reorder or rename joints);
-- the canonical GLB stores that same joint order (``canonical_joint_order``);
+  (a cond rebuilt since sampling can reorder or rename joints) and, when the
+  motion records it, the frame it was sampled in (``frame_digest``,
+  ``asset_files.cond_frame_digest``: joint names, hierarchy and canonical
+  T-pose; a rest pose patched since sampling keeps the names but moves the
+  frame);
+- the canonical GLB stores that same joint order (``canonical_joint_order``)
+  and, when it records one, the cond's frame (``canonical_frame_digest``);
 - the motion has as many joints.
 
 A mismatch is an error rather than a silently scrambled animation.
@@ -35,7 +40,8 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from data_process.utils.asset_files import (  # noqa: E402
-    DEFAULT_MIXAMO_CHARACTER, default_assets_dir, glb_joint_order)
+    DEFAULT_MIXAMO_CHARACTER, FRAME_DIGEST_KEY, cond_frame_digest, default_assets_dir,
+    glb_joint_order, glb_node_extra)
 
 MANIFEST_FILE = 'manifest.json'
 FORMAT_PREFIX = 'unimate-samples/'
@@ -84,6 +90,7 @@ def build_jobs(path, include_gt=False, char_path=None, character=None):
     jobs, problems = [], []
     checked = {}
     conds = {}
+    frames = {}   # asset -> the cond file entry's frame digest (None: not checkable)
 
     def asset_glb(info):
         glb = info.get('canonical_glb')
@@ -110,6 +117,7 @@ def build_jobs(path, include_gt=False, char_path=None, character=None):
             return issues
         names = [str(n) for n in info.get('joint_names', [])]
         cond_path = info.get('cond_path')
+        frames[name] = None
         if not cond_path or not os.path.isfile(cond_path):
             issues.append(f"{name}: cond file {cond_path!r} not found")
         else:
@@ -119,6 +127,8 @@ def build_jobs(path, include_gt=False, char_path=None, character=None):
             elif [str(n) for n in entry['joint_names']] != names:
                 issues.append(f"{name}: {cond_path} changed since sampling (joint order "
                               f"differs); sample again")
+            else:
+                frames[name] = cond_frame_digest(entry)
         if char_path is None:
             glb = asset_glb(info)
             if not glb or not os.path.isfile(glb):
@@ -132,11 +142,15 @@ def build_jobs(path, include_gt=False, char_path=None, character=None):
                 issues.append(f"{name}: no canonical GLB ({glb!r}); {hint}")
             else:
                 order = glb_joint_order(glb)
+                baked = glb_node_extra(glb, FRAME_DIGEST_KEY)
                 if order is None:
                     issues.append(f"{name}: {glb} carries no canonical joint order")
                 elif order != names:
                     issues.append(f"{name}: {glb} was baked from another cond (joint order "
                                   f"differs from the sampled one)")
+                elif baked and frames[name] and baked != frames[name]:
+                    issues.append(f"{name}: {glb} was baked from another cond (canonical "
+                                  f"T-pose differs from {cond_path}'s); rebuild it")
         checked[name] = issues
         return issues
 
@@ -153,6 +167,11 @@ def build_jobs(path, include_gt=False, char_path=None, character=None):
             n_asset = len(assets[name]['joint_names'])
             if n_motion != n_asset:
                 issues.append(f"{npy}: {n_motion} joints, asset {name!r} has {n_asset}")
+            elif sample.get('frame_digest') and frames.get(name) \
+                    and sample['frame_digest'] != frames[name]:
+                issues.append(f"{npy}: sampled in another canonical frame of {name!r} than "
+                              f"{assets[name].get('cond_path')} holds now (T-pose or "
+                              f"hierarchy changed); sample again")
         if issues:
             problems.extend(issues)
             continue

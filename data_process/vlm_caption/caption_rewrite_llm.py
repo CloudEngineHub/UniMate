@@ -56,6 +56,8 @@ PROP_RE = re.compile(
     r'grabbing|lifting|raising|throwing|catching|kicking|hitting|striking|drawing|aiming)\s+'
     r'(?:%s)s?\b' % (PROP_WORDS, AMBIGUOUS_WORDS), re.IGNORECASE)
 SUBJECT_RE = re.compile(r'^(A person|An object|An animal)\b')
+# Word limit the prompt states and validate() enforces.
+MAX_WORDS = 15
 
 SYSTEM_PROMPT = """You edit captions for a motion-capture dataset. Each caption describes a short animation of a rigged body rendered WITHOUT any props, weapons, tools, scenery or other objects: only the body itself is visible.
 
@@ -63,7 +65,7 @@ Rewrite the caption so that it names NO object at all and describes only the bod
 
 Rules:
 - Keep the subject phrase exactly as given ("A person", "An object" or "An animal").
-- One sentence, present tense, at most 15 words, ending with a period.
+- One sentence, present tense, at most %d words, ending with a period.
 - Do not add actions that are not implied by the original caption; do not drop actions that are.
 - Where a pose clearly implies handling something, you may write "as if holding something", "as if aiming" or "as if carrying something" (at most once). Never say what the thing is.
 - Forbidden words: any object noun (rifle, sword, ball, phone, ladder, wall, chair, ...), and also weapon, item, tool, prop, object (except in the subject "An object").
@@ -80,7 +82,7 @@ A person talks on the phone while walking. -> A person walks while holding one h
 An object crouches while holding a shield and sword. -> An object crouches with both arms raised as if holding something.
 A person reloads a rifle while standing. -> A person stands and moves both hands in front of the chest.
 A person leans against a wall. -> A person leans sideways with the shoulder raised.
-A person sits in a chair and crosses their legs. -> A person sits and crosses their legs."""
+A person sits in a chair and crosses their legs. -> A person sits and crosses their legs.""" % MAX_WORDS
 
 
 def load_json(path):
@@ -106,7 +108,7 @@ def validate(new, old, pattern):
         return 'subject changed'
     if pattern.search(new):
         return 'prop word: ' + pattern.search(new).group(0)
-    if len(new.split()) > 18:
+    if len(new.split()) > MAX_WORDS:
         return 'too long'
     if new.count('.') > 1:
         return 'multiple sentences'
@@ -149,7 +151,10 @@ def main():
     n_ok = 0
     for k, clip in enumerate(clips, 1):
         old = captions[clip]
-        if clip in result and result[clip].get('ok') and result[clip].get('old') == old:
+        prev = result.get(clip, {})
+        # Kept only while it still passes the current checks (word limit, props).
+        if (prev.get('ok') and prev.get('old') == old
+                and not validate(prev.get('new', ''), old, pattern)):
             n_ok += 1
             continue
         best, best_err, tries = '', 'no answer', 0

@@ -268,6 +268,14 @@ def collect_captions(cond):
     return all_captions
 
 
+def _remove_stale(save_dir, name, why):
+    """Remove ``<save_dir>/<name>`` left by an earlier run, if any."""
+    path = pjoin(save_dir, name)
+    if os.path.isfile(path):
+        os.remove(path)
+        print(f'Removed stale {path} ({why} this run)')
+
+
 def save_extra_captions(save_dir, all_captions, version, export_captions):
     """Write ``captions_<version>.json`` (keyed like ``captions.json``) from
     the export's ``motion_captions_<version>.json`` map, or remove a stale
@@ -281,14 +289,13 @@ def save_extra_captions(save_dir, all_captions, version, export_captions):
         missing = sorted(set(all_captions) - set(out))
         print(f'Saved {len(out)}/{len(all_captions)} {version} clip captions'
               + (f'; {len(missing)} saved clips have none, e.g. {missing[:3]}' if missing else ''))
-    elif os.path.isfile(path):
-        os.remove(path)
-        print(f'Removed stale {path} (no {version} captions this run)')
+    else:
+        _remove_stale(save_dir, f'captions_{version}.json', f'no {version} captions')
     return out
 
 
 def save_outputs(save_dir, cond, all_filtered_clips, category_groups=None,
-                 extra_captions=None):
+                 extra_captions=None, keep_category_groups=False):
     """Save ``cond.npy``, filtered clips, captions, and category groupings.
 
     Caption files, keyed alike by saved clip (``<clip>-<NNN>``):
@@ -300,7 +307,13 @@ def save_outputs(save_dir, cond, all_filtered_clips, category_groups=None,
     never re-processes an object; a version without captions has its stale
     ``captions_<v>.json`` removed.
 
-    Captions and category groups are only written when present. Every file is
+    Filtered clips, captions and category groups are only written when
+    present; when absent, the file an earlier run wrote is removed (the
+    training loader takes a missing ``captions.json`` as caption-free data
+    and selects category subsets from ``category_groups.json``), except a
+    ``category_groups.json`` the run was told to leave alone
+    (*keep_category_groups*: ``--category_groups ""``, the file is copied in
+    by hand). Every file is
     written atomically, so an interrupted run cannot leave a truncated output
     behind for the training loader to trip over. Returns the merged captions
     dict so callers can pass it to ``save_metadata_report``.
@@ -311,17 +324,23 @@ def save_outputs(save_dir, cond, all_filtered_clips, category_groups=None,
         save_json(pjoin(save_dir, 'filtered_clips.json'), all_filtered_clips)
         total = sum(len(v) for v in all_filtered_clips.values())
         print(f'Saved {total} filtered clips to filtered_clips.json')
+    else:
+        _remove_stale(save_dir, 'filtered_clips.json', 'no filtered clips')
 
     all_captions = collect_captions(cond)
     if all_captions:
         save_json(pjoin(save_dir, 'captions.json'), all_captions)
         print(f'Saved {len(all_captions)} clip captions')
+    else:
+        _remove_stale(save_dir, 'captions.json', 'no captions')
     for version in EXTRA_CAPTION_VERSIONS:
         save_extra_captions(save_dir, all_captions, version,
                             (extra_captions or {}).get(version))
 
     if category_groups:
         save_json(pjoin(save_dir, 'category_groups.json'), category_groups)
+    elif not keep_category_groups:
+        _remove_stale(save_dir, 'category_groups.json', 'no category groups')
 
     return all_captions
 

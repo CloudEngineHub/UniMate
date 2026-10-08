@@ -17,7 +17,12 @@ clip of that object type (``<features_dir>/motions/*.npz``: ``local_rotations``
 The joint order rides in the GLB as ``canonical_joint_order`` and a digest of
 its inputs (the cond entry, its diameter, the source GLB's bytes and
 ``BAKE_VERSION``) as ``canonical_cond_digest``: an asset whose cond or source
-changed is rebuilt on the next run, the others are skipped. A skeleton whose
+changed is rebuilt on the next run, the others are skipped. The cond's frame
+alone (``asset_files.cond_frame_digest``) rides along as
+``canonical_frame_digest``: an asset whose source GLB is gone (an object type
+of the cond, or a Mixamo character with a canonical GLB but no ``rigs/`` GLB)
+keeps its canonical GLB only while that matches the cond, and one without the
+key cannot be checked and is kept. Mesh driving checks the same key. A skeleton whose
 roll about its joint line the fit cannot determine (collinear joints, or nearly
 collinear ones for the fit's residual) is refused.
 
@@ -70,8 +75,9 @@ from Quaternions import Quaternions  # noqa: E402
 
 from data_process.mesh_animation.canonical_rig import UndeterminedRoll, bake_canonical_asset  # noqa: E402
 from data_process.utils.asset_files import (  # noqa: E402
-    GLB_ERRORS_DIR, PROCESSED_GLB_DIR, TEXTURE_ISSUES_DIR,
-    default_assets_dir, glb_image_digests, glb_node_extra, write_note,
+    FRAME_DIGEST_KEY, GLB_ERRORS_DIR, PROCESSED_GLB_DIR, TEXTURE_ISSUES_DIR,
+    cond_digest, cond_frame_digest, default_assets_dir, glb_image_digests, glb_node_extra,
+    write_note,
 )
 from data_process.utils.blender_export import (  # noqa: E402
     import_gltf, load_scene, prepare_skeleton,
@@ -80,22 +86,13 @@ from data_process.utils.motion_features import process_tpose  # noqa: E402
 from data_process.utils.skeleton import get_skeleton_diameter, line_ratio  # noqa: E402
 
 DIGEST_KEY = 'canonical_cond_digest'
+# Every file a bake can write for an asset (bake_canonical_asset's formats).
+CANONICAL_FORMATS = ('glb', 'fbx')
 # Mixamo characters: the clips' rest root in the canonical frame (module docstring).
 MOTION_ROOT_KEY = 'canonical_motion_rest_root'
 # Part of every digest: bump it when the bake's output changes for the same
 # inputs, so the next run rebuilds every GLB.
 BAKE_VERSION = 'v3'
-
-
-def cond_digest(entry):
-    """sha1 of what the baked asset depends on: joint names, hierarchy and
-    the canonical T-pose (rounded to 1e-6)."""
-    h = hashlib.sha1()
-    h.update(json.dumps([str(n) for n in entry['joint_names']]).encode())
-    h.update(np.asarray(entry['parents'], dtype=np.int64).tobytes())
-    for key in ('tpos_first_frame', 'tpos_global_rotations'):
-        h.update(np.round(np.asarray(entry[key], dtype=np.float64), 6).tobytes())
-    return h.hexdigest()
 
 
 def cond_diameter(entry):
@@ -207,6 +204,23 @@ def _texture_note(assets_dir, name, source, baked):
         logger.warning(f"'{name}': canonical GLB lost image(s) {lost}")
 
 
+def _shard(name, num_workers):
+    """The worker (of *num_workers*) that handles asset *name*."""
+    return int(hashlib.sha1(name.encode()).hexdigest(), 16) % num_workers
+
+
+def _remove_asset_files(out_dir, name, partial=None):
+    """Remove ``<name>.<fmt>`` for every format a bake can write (a run asks
+    for fewer than an earlier one may have written), the ``<partial>.<fmt>``
+    files of a broken bake and the asset's texture note."""
+    for fmt in CANONICAL_FORMATS:
+        for path in [os.path.join(out_dir, f'{name}.{fmt}')] + \
+                ([f'{partial}.{fmt}'] if partial else []):
+            if os.path.isfile(path):
+                os.remove(path)
+    write_note(out_dir, TEXTURE_ISSUES_DIR, name, [])
+
+
 def bake_canonical_assets(export_dir, features_dir, assets_dir=None, dataset_type=None,
                           object_types=None, worker_id=0, num_workers=1, overwrite=False,
                           formats=('glb',)):
@@ -214,8 +228,10 @@ def bake_canonical_assets(export_dir, features_dir, assets_dir=None, dataset_typ
     defaults to :func:`default_assets_dir`), plus ``<object_type>.fbx`` when
     *formats* holds ``'fbx'`` (the GLB is always written: it carries the digest).
 
-    Returns ``{'baked': n, 'up_to_date': n, 'no_source': n, 'refused': n,
-    'failed': n}`` (refused: collinear skeletons, an expected outcome).
+    Returns ``{'baked': n, 'up_to_date': n, 'no_source': n, 'stale_removed': n,
+    'refused': n, 'failed': n}`` (refused: collinear skeletons, an expected
+    outcome; stale_removed: the no_source assets whose GLB was baked from
+    another cond frame and was removed with its other formats).
     """
     if not 0 <= worker_id < num_workers:
         raise ValueError(f"worker_id {worker_id} not in [0, {num_workers})")
@@ -227,21 +243,34 @@ def bake_canonical_assets(export_dir, features_dir, assets_dir=None, dataset_typ
         # (asset name, source GLB, object type) per character.
         if 'mixamo' not in cond:
             raise ValueError(f"{features_dir}/cond.npy has no 'mixamo' entry")
-        chars = sorted(f[:-4] for f in os.listdir(src_dir)
-                       if f.endswith('.glb') and not f.startswith('.')) \
-            if os.path.isdir(src_dir) else []
+        # Characters with a canonical GLB but no source are checked too.
+        chars = sorted({f[:-4] for d in (src_dir, out_dir) if os.path.isdir(d)
+                        for f in os.listdir(d) if f.endswith('.glb') and not f.startswith('.')})
         jobs = [(c, os.path.join(src_dir, f'{c}.glb'), 'mixamo') for c in chars
                 if object_types is None or c in object_types]
     else:
         types = sorted(cond) if object_types is None else [t for t in object_types if t in cond]
         jobs = [(t, os.path.join(src_dir, f'{t}.glb'), t) for t in types]
-    jobs = jobs[worker_id::num_workers]
-    counts = {'baked': 0, 'up_to_date': 0, 'no_source': 0, 'refused': 0, 'failed': 0}
+    # A worker's share is fixed by the asset name, not by its position in the
+    # list: a worker that removes a stale Mixamo GLB changes the listing the
+    # workers started after it see.
+    jobs = [job for job in jobs if _shard(job[0], num_workers) == worker_id]
+    counts = {'baked': 0, 'up_to_date': 0, 'no_source': 0, 'stale_removed': 0,
+              'refused': 0, 'failed': 0}
     for name, source, object_type in jobs:
+        final = os.path.join(out_dir, f'{name}.glb')
+        frame = cond_frame_digest(cond[object_type])
         if not os.path.isfile(source):
             counts['no_source'] += 1
+            stored = glb_node_extra(final, FRAME_DIGEST_KEY)
+            if stored is not None and frame is not None and stored != frame:
+                # Baked from another cond and cannot be rebuilt: it would be
+                # driven as if current.
+                _remove_asset_files(out_dir, name)
+                logger.warning(f"Canonical GLB of '{name}' removed: it was baked from "
+                               f"another cond frame and its source {source} is gone")
+                counts['stale_removed'] += 1
             continue
-        final = os.path.join(out_dir, f'{name}.glb')
         extra_files = [(fmt, os.path.join(out_dir, f'{name}.{fmt}'))
                        for fmt in formats if fmt != 'glb']
         # What the GLB is built from: the cond entry (and its diameter, which
@@ -268,7 +297,8 @@ def bake_canonical_assets(export_dir, features_dir, assets_dir=None, dataset_typ
             _check_not_collinear(target)
             bake_canonical_asset(source, target, partial,
                                  formats=('glb',) + tuple(fmt for fmt, _ in extra_files),
-                                 extra_props={DIGEST_KEY: digest, **extra})
+                                 extra_props={DIGEST_KEY: digest, FRAME_DIGEST_KEY: frame,
+                                              **extra})
             for fmt, path in extra_files:
                 os.replace(f'{partial}.{fmt}', path)
             os.replace(partial + '.glb', final)
@@ -281,11 +311,7 @@ def bake_canonical_assets(export_dir, features_dir, assets_dir=None, dataset_typ
                 counts['failed'] += 1
             write_note(out_dir, GLB_ERRORS_DIR, name, [f'{type(exc).__name__}: {exc}'])
             # A GLB of older inputs would be driven as if current: remove it.
-            for stale in [partial + '.glb', final] + [p for _, p in extra_files] \
-                    + [f'{partial}.{fmt}' for fmt, _ in extra_files]:
-                if os.path.isfile(stale):
-                    os.remove(stale)
-            write_note(out_dir, TEXTURE_ISSUES_DIR, name, [])
+            _remove_asset_files(out_dir, name, partial)
             continue
         write_note(out_dir, GLB_ERRORS_DIR, name, [])
         try:

@@ -209,12 +209,14 @@ def parse_args(argv=None):
                         help="Path to the body-plan category JSON copied into "
                              "the feature dir (the training loader reads it for "
                              "objects_subset). Default 'auto' uses "
-                             "<data_dir>/category_groups.json if present. Pass "
+                             "<data_dir>/category_groups.json if present; "
+                             "with none, an earlier run's copy is removed. Pass "
                              "an empty string to leave it out — the stage-2 "
                              "classifier may still be running, and a partial "
                              "file would land in the feature dir as if it were "
-                             "complete. Copy the finished file in afterwards; "
-                             "nothing else in this stage reads it.")
+                             "complete. Copy the finished file in afterwards "
+                             "(a later run with an empty string leaves it in "
+                             "place); nothing else in this stage reads it.")
     # Execution
     parser.add_argument("--num_workers", type=int, default=1,
                         help="Parallel worker processes (object types are independent)")
@@ -608,8 +610,10 @@ def process_object_task(task):
 
     Failures are contained here: the object is reported as failed (and its
     error appended to ``extract_errors.log``) instead of propagating, which
-    with ``mp.Pool`` would kill the whole run. No cache entry is written for
-    a failed object, so it is retried on the next run.
+    with ``mp.Pool`` would kill the whole run. On a cache miss the old entry
+    is removed before the object's clips are pruned, and no entry is written
+    for a failed object, so it is retried on the next run whatever its
+    settings.
 
     Returns ``(object_type, result_dict, from_cache)``.
     """
@@ -626,12 +630,16 @@ def process_object_task(task):
     if cached is not None:
         return object_type, cached, True
 
-    removed = _prune_object_clips(task['save_dir'], clip_prefix, task['save_vis'])
-    if removed:
-        logger.info(f'[{object_type}] removed {removed} clip files from a '
-                    f'previous run before re-processing')
-
     try:
+        # The stale entry goes before the clips it describes: a run that
+        # fails below must not leave an entry that a later run with the old
+        # settings would reuse without its clips.
+        if os.path.isfile(part_path):
+            os.remove(part_path)
+        removed = _prune_object_clips(task['save_dir'], clip_prefix, task['save_vis'])
+        if removed:
+            logger.info(f'[{object_type}] removed {removed} clip files from a '
+                        f'previous run before re-processing')
         obj_cond, n_clips, n_frames, n_joints, filtered = process_object(
             object_type, **task)
     except Exception as e:  # noqa: BLE001 — keep the batch going
@@ -812,7 +820,8 @@ def main(args):
 
     all_captions = save_outputs(args.save_dir, cond, all_filtered_clips,
                                 category_groups=category_groups,
-                                extra_captions=extra_captions)
+                                extra_captions=extra_captions,
+                                keep_category_groups=args.category_groups == '')
     stats = build_stats(clips_per_object, joints_per_object, total_frames, max_njoints)
     print_summary(stats)
     save_metadata_report(args.save_dir, stats, all_filtered_clips,

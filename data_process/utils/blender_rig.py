@@ -137,6 +137,44 @@ def repair_and_pack_textures(source_path):
     return broken
 
 
+def _file_holds(path, data):
+    """Whether the file at *path* holds exactly the bytes *data*."""
+    if os.path.getsize(path) != len(data):
+        return False
+    with open(path, 'rb') as fh:
+        return fh.read() == bytes(data)
+
+
+def write_sidecar(texture_dir, name, ext, data):
+    """``<texture_dir>/<name><ext>`` holding *data*, or the first free
+    ``<name>_<n><ext>``; the path, or None when nothing could be written.
+
+    A file holding other bytes keeps its name: sanitizing maps ``A B`` and
+    ``A+B`` to one name, and every asset exported into a directory shares its
+    ``textures/``. A name is claimed by creating the file exclusively, so
+    processes exporting into one directory at once never replace each
+    other's files; a file that already holds *data* is reused."""
+    os.makedirs(texture_dir, exist_ok=True)
+    path, n = os.path.join(texture_dir, name + ext), 1
+    while True:
+        try:
+            with open(path, 'xb') as fh:
+                try:
+                    fh.write(data)
+                except OSError:
+                    os.remove(path)
+                    raise
+            return path
+        except FileExistsError:
+            if _file_holds(path, data):
+                return path
+        except OSError as exc:
+            logger.warning(f"Could not write texture sidecar {path}: {exc}")
+            return None
+        path = os.path.join(texture_dir, f'{name}_{n}{ext}')
+        n += 1
+
+
 def write_packed_images_to_dir(texture_dir):
     """Write packed images that have no on-disk file out to *texture_dir*.
 
@@ -145,7 +183,8 @@ def write_packed_images_to_dir(texture_dir):
     (typical after a GLB import) are silently skipped, losing textures.
     Writing them out right before FBX export makes embedding work.
 
-    Returns the list of file paths written.
+    Returns the sidecar paths the images now point at (written here, or
+    already holding their bytes).
     """
     written = []
     for idx, img in enumerate(bpy.data.images):
@@ -158,20 +197,17 @@ def write_packed_images_to_dir(texture_dir):
         safe_name = re.sub(r'[^A-Za-z0-9_.-]+', '_', img.name).strip('_') or f'image_{idx}'
         if not safe_name.lower().endswith(ext):
             safe_name += ext
-        os.makedirs(texture_dir, exist_ok=True)
-        out_path = os.path.join(texture_dir, safe_name)
+        # The packed bytes verbatim (no re-encode), where filepath_raw then
+        # points, so the exporter's embed path finds them. (img.unpack()
+        # writes to the image's *original* path instead.)
+        out_path = write_sidecar(texture_dir, safe_name[:-len(ext)], ext,
+                                 bytes(img.packed_file.data))
+        if out_path is None:
+            continue
         img.filepath_raw = out_path
-        try:
-            # Dump the packed bytes verbatim (no re-encode) exactly where
-            # filepath_raw points, so the exporter's embed path finds them.
-            # (img.unpack() writes to the image's *original* path instead.)
-            with open(out_path, 'wb') as fh:
-                fh.write(img.packed_file.data)
-            written.append(out_path)
-        except OSError as exc:
-            logger.warning(f"Could not write packed image '{img.name}' to disk: {exc}")
+        written.append(out_path)
     if written:
-        logger.info(f"Wrote {len(written)} packed image(s) to {texture_dir} for FBX embedding")
+        logger.info(f"Put {len(written)} packed image(s) in {texture_dir} for FBX embedding")
     return written
 
 

@@ -27,7 +27,8 @@ from typing import Dict, Iterable, List, Optional
 
 import numpy as np
 
-from data_process.utils.asset_files import DEFAULT_MIXAMO_CHARACTER, default_assets_dir
+from data_process.utils.asset_files import (
+    DEFAULT_MIXAMO_CHARACTER, cond_frame_digest, default_assets_dir)
 from unimate.utils.logger import get_logger
 
 logger = get_logger(file_name=__file__)
@@ -90,6 +91,7 @@ class Asset:
             'canonical_glb': _display_path(self.canonical_glb) if self.canonical_glb else None,
             'stats_dataset': self.stats_dataset,
             'joint_names': self.joint_names,
+            'frame_digest': cond_frame_digest(self.cond),
         }
 
 
